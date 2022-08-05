@@ -1,5 +1,7 @@
 const Twilio = require("twilio");
-const { logInterimAction } = require("./logs.private.js");
+
+const logsPath = Runtime.getAssets()['/logs.js'].path;
+const { logFinalAction, logInitialAction, logInterimAction } = require(logsPath);
 
 const { CONVERSATIONS_SERVICE_SID, ACCOUNT_SID, API_KEY, API_SECRET, TOKEN_TTL_IN_SECONDS } = process.env;
 
