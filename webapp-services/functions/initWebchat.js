@@ -6,7 +6,7 @@ const { logFinalAction, logInitialAction, logInterimAction } = require(logsPath)
 const createTokenPath = Runtime.getAssets()['/createToken.js'].path;
 const { createToken } = require(createTokenPath);
 
-const { TOKEN_TTL_IN_SECONDS, ADDRESS_SID, ACCOUNT_SID, AUTH_TOKEN } = process.env;
+const { TOKEN_TTL_IN_SECONDS, ADDRESS_SID, ACCOUNT_SID, AUTH_TOKEN, FLOW_SID } = process.env;
 
 exports.handler = async (context, event, callback) => {
 
@@ -40,10 +40,7 @@ exports.handler = async (context, event, callback) => {
     // OPTIONAL — if user query is defined
     if (event.formData?.query) {
         // use it to send a message in behalf of the user with the query as body
-        await sendUserMessage(twilioClient, conversationSid, identity, event.formData.query).then(() =>
-            // and then send another message from Concierge, letting the user know that an agent will help them soon
-            sendWelcomeMessage(twilioClient, conversationSid, customerFriendlyName)
-        );
+        await sendUserMessage(twilioClient, conversationSid, identity, event.formData.query)
     }
 
     response.setBody({
@@ -60,36 +57,117 @@ exports.handler = async (context, event, callback) => {
 
 const contactWebchatOrchestrator = async (request, customerFriendlyName) => {
     logInterimAction("Calling Webchat Orchestrator");
-
-    const params = new URLSearchParams();
-    params.append("AddressSid", ADDRESS_SID);
-    params.append("ChatFriendlyName", "Webchat widget");
-    params.append("CustomerFriendlyName", customerFriendlyName);
-    params.append(
-        "PreEngagementData",
-        JSON.stringify({
-            ...request.formData,
-            friendlyName: customerFriendlyName
-        })
-    );
+    const customerEmail = request.formData?.email.replace(/@/, "");
 
     let conversationSid;
     let identity;
 
+
+    const paramsUser = new URLSearchParams();
+    paramsUser.append("Identity", customerEmail);
+    paramsUser.append("FriendlyName", customerFriendlyName);
+
     try {
-        const res = await axios.post(`https://flex-api.twilio.com/v2/WebChats`, params, {
+        const resUser = await axios.post(`https://conversations.twilio.com/v1/Users/`, paramsUser, {
             auth: {
-                username: ACCOUNT_SID,
-                password: AUTH_TOKEN
+                username: process.env.ACCOUNT_SID,
+                password: process.env.AUTH_TOKEN
             }
         });
-        ({ identity, conversation_sid: conversationSid } = res.data);
+
+        logInterimAction("User created ", resUser.data.sid);
     } catch (e) {
-        logInterimAction("Something went wrong during the orchestration:", e.response?.data?.message);
+        if (e.response?.data?.code === 50201) {
+            logInterimAction("User already exist -> ", customerEmail);
+        } else {
+            logInterimAction("Something went wrong during user creation:", e.response?.data?.message);
+            throw e.response.data;
+        }
+    }
+
+    try {
+        const resUserConversations = await axios.get(`https://conversations.twilio.com/v1/ParticipantConversations?Identity=${customerEmail}`, {
+            headers: {
+                Authorization: `Basic ${Buffer.from(`${process.env.ACCOUNT_SID}:${process.env.AUTH_TOKEN}`, 'utf8').toString('base64')}`
+            }
+        });
+
+        const openConversation = resUserConversations.data.conversations.find(conv => conv.conversation_state === "active")
+
+        if (openConversation) {
+            conversationSid = openConversation.conversation_sid;
+            identity = customerEmail
+
+            logInterimAction("Active conversation found", conversationSid);
+            logInterimAction("Participant already in conversation ");
+        } else {
+            const params = new URLSearchParams();
+            // params.append("AddressSid", ADDRESS_SID);
+            params.append("FriendlyName", `Webchat - ${customerEmail}`);
+            const [timestamp] = new Date().toJSON().replace(/-/g, "").replace("T", "").replace(/:/g, "").split(".");
+            params.append("UniqueName", `${customerEmail}${timestamp}`);
+            params.append(
+                "PreEngagementData",
+                JSON.stringify({
+                    ...request.formData,
+                    friendlyName: customerFriendlyName
+                })
+            );
+            const newConversation = await axios.post(`https://conversations.twilio.com/v1/Conversations`, params, {
+                auth: {
+                    username: process.env.ACCOUNT_SID,
+                    password: process.env.AUTH_TOKEN
+                }
+            });
+            conversationSid = newConversation.data.sid
+
+            logInterimAction("New conversation created ", conversationSid);
+
+            try {
+                const paramsWebhook = new URLSearchParams();
+                // params.append("AddressSid", ADDRESS_SID);
+                paramsWebhook.append("Configuration.Method", "POST");
+                paramsWebhook.append("Configuration.Filters", "onMessageAdded");
+                paramsWebhook.append("Configuration.FlowSid", FLOW_SID);
+                paramsWebhook.append("Target", "studio");
+
+                const resWebhook = await axios.post(`https://conversations.twilio.com/v1/Conversations/${conversationSid}/Webhooks`, paramsWebhook, {
+                    auth: {
+                        username: process.env.ACCOUNT_SID,
+                        password: process.env.AUTH_TOKEN
+                    }
+                });
+
+                logInterimAction("Conversation Webhook created ", resWebhook.data.sid);
+
+            } catch (e) {
+                logInterimAction("Something went wrong during participant creation:", e.response?.data?.message);
+                throw e.response.data;
+            }
+
+            try {
+                const resParticipant = await axios.post(`https://conversations.twilio.com/v1/Conversations/${conversationSid}/Participants`, paramsUser, {
+                    auth: {
+                        username: process.env.ACCOUNT_SID,
+                        password: process.env.AUTH_TOKEN
+                    }
+                });
+
+                logInterimAction("Participant created ", resParticipant.data.sid);
+                ({ identity } = resParticipant.data);
+
+            } catch (e) {
+                logInterimAction("Something went wrong during participant creation:", e.response?.data?.message);
+                throw e.response.data;
+            }
+        }
+    } catch (e) {
+        logInterimAction("Something went wrong during the orchestration:", e);
         throw e.response.data;
     }
 
     logInterimAction("Webchat Orchestrator successfully called");
+    logInterimAction("Connecting webchat to Conversation ", conversationSid);
 
     return {
         conversationSid,
@@ -114,21 +192,5 @@ const sendUserMessage = (twilioClient, conversationSid, identity, messageBody) =
             console.log("error", e)
 
             logInterimAction(`(async) Couldn't send user message: ${e?.message}`);
-        });
-};
-
-const sendWelcomeMessage = (twilioClient, conversationSid, customerFriendlyName) => {
-    logInterimAction("Sending welcome message");
-    return twilioClient
-        .conversations.conversations(conversationSid)
-        .messages.create({
-            body: `Welcome ${customerFriendlyName}! An agent will be with you in just a moment.`,
-            author: "Concierge"
-        })
-        .then(() => {
-            logInterimAction("(async) Welcome message sent");
-        })
-        .catch((e) => {
-            logInterimAction(`(async) Couldn't send welcome message: ${e?.message}`);
         });
 };
